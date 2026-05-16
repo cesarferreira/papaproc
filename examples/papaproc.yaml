@@ -1,0 +1,48 @@
+version: 1
+project: papaproc-demo
+
+groups:
+  backend:
+    tasks: [db, api]
+  frontend:
+    tasks: [web]
+  tests:
+    tasks: [unit]
+
+diagnostics:
+  - match: "connection refused"
+    title: "Dependency not ready"
+    suggest: "Check readiness probe or dependency order."
+
+tasks:
+  db:
+    cmd: docker compose up db
+    ready:
+      tcp: localhost:5432
+      timeout: 30s
+
+  api:
+    cmd: cargo run
+    cwd: apps/api
+    depends_on:
+      db: ready
+    ready:
+      http: http://localhost:8080/health
+      timeout: 30s
+    restart:
+      on_dependency_restart: true
+      attempts: 3
+      window: 30s
+
+  web:
+    cmd: bun dev
+    cwd: apps/web
+    depends_on:
+      api: ready
+    ready:
+      http: http://localhost:5173
+
+  unit:
+    cmd: bun test --watch
+    cwd: apps/web
+    mode: manual
