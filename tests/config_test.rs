@@ -74,3 +74,34 @@ tasks:
 
     assert!(error.to_string().contains("dependency cycle"));
 }
+
+#[test]
+fn fake_stack_sample_config_is_valid() {
+    let yaml = std::fs::read_to_string("examples/fake-stack/papaproc.yaml")
+        .expect("fake stack sample config should exist");
+
+    let config = LoadConfig::from_yaml(&yaml).expect("fake stack sample config should parse");
+
+    assert_eq!(config.project.as_deref(), Some("fake-stack"));
+    assert!(config.groups.contains_key("demo"));
+    assert!(config.tasks.contains_key("fake-db"));
+    assert!(config.tasks.contains_key("fake-api"));
+    assert!(config.tasks.contains_key("fake-web"));
+    assert!(config.tasks.contains_key("noisy-logs"));
+}
+
+#[test]
+fn top_level_example_config_is_runnable_fake_stack() {
+    let yaml = std::fs::read_to_string("examples/papaproc.yaml")
+        .expect("top-level example config should exist");
+
+    let config = LoadConfig::from_yaml(&yaml).expect("top-level example config should parse");
+
+    assert_eq!(config.project.as_deref(), Some("fake-stack"));
+    assert_eq!(
+        config.tasks["fake-db"].cwd.as_deref(),
+        Some(std::path::Path::new("examples/fake-stack"))
+    );
+    assert!(config.tasks.contains_key("fake-api"));
+    assert!(config.tasks.contains_key("fake-web"));
+}
