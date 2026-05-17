@@ -864,6 +864,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "ratatui",
  "regex",
  "reqwest",

@@ -12,6 +12,7 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, timeout};
 
 #[derive(Clone)]
 pub struct Supervisor {
@@ -139,11 +140,12 @@ impl Supervisor {
 
     pub async fn stop_task(&self, name: &str) -> Result<()> {
         if let Some(child) = self.children.lock().await.remove(name) {
+            self.set_status(name, TaskStatus::Stopped, None).await;
             let mut child = child.lock().await;
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_child(&mut child).await;
+        } else {
+            self.set_status(name, TaskStatus::Stopped, None).await;
         }
-        self.set_status(name, TaskStatus::Stopped, None).await;
         Ok(())
     }
 
@@ -381,7 +383,34 @@ async fn spawn_child(task: &TaskConfig) -> Result<Child> {
         command.current_dir(cwd);
     }
     command.envs(&task.env);
+    #[cfg(unix)]
+    command.process_group(0);
     command
         .spawn()
         .with_context(|| format!("failed to spawn '{}'; command: {}", program, task.cmd))
+}
+
+async fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            signal_process_group(pid, libc::SIGTERM);
+            if timeout(Duration::from_secs(2), child.wait()).await.is_ok() {
+                return;
+            }
+            signal_process_group(pid, libc::SIGKILL);
+            let _ = child.wait().await;
+            return;
+        }
+    }
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: i32) {
+    unsafe {
+        libc::kill(-(pid as i32), signal);
+    }
 }

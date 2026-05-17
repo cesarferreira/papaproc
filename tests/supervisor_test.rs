@@ -123,6 +123,37 @@ tasks:
     assert_eq!(starts.lines().count(), 2);
 }
 
+#[tokio::test]
+async fn stop_task_kills_shell_descendants() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("grandchild.pid");
+    let pid_file_display = pid_file.display();
+    let config = LoadConfig::from_yaml(&format!(
+        r#"
+version: 1
+tasks:
+  worker:
+    cmd: sh -c 'sleep 30 & echo $! > "{pid_file_display}"; wait'
+    mode: once
+"#
+    ))
+    .unwrap();
+    let supervisor = Supervisor::new(config).unwrap();
+
+    supervisor.start_task("worker").await.unwrap();
+    wait_for_file(&pid_file).await;
+    let grandchild_pid = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+
+    supervisor.stop_task("worker").await.unwrap();
+    wait_for_process_to_exit(grandchild_pid).await;
+
+    assert!(!process_exists(grandchild_pid));
+}
+
 async fn wait_for_status(state: Arc<Mutex<SessionState>>, task: &str, status: TaskStatus) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -176,4 +207,43 @@ async fn wait_for_file_lines(path: String, count: usize) {
         );
         sleep(Duration::from_millis(25)).await;
     }
+}
+
+async fn wait_for_file(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if path.exists() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {} to exist",
+            path.display()
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_process_to_exit(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if !process_exists(pid) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for process {pid} to exit"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    false
 }
