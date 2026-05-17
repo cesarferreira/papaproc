@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 pub async fn run_tui(supervisor: Supervisor, selectors: Vec<String>) -> Result<()> {
     let supervisor = Arc::new(supervisor);
     let state = supervisor.state();
+    let graph = supervisor.graph_text();
     let startup_supervisor = supervisor.clone();
     let start = tokio::spawn(async move { startup_supervisor.start_selected(&selectors).await });
 
@@ -27,11 +28,13 @@ pub async fn run_tui(supervisor: Supervisor, selectors: Vec<String>) -> Result<(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut selected = 0usize;
+    let mut panel = DetailPanel::Help;
+    let mut errors_only = false;
 
     let mut start = Some(start);
     let result = loop {
         let snapshot = state.lock().await.clone();
-        terminal.draw(|frame| draw(frame, &snapshot, selected))?;
+        terminal.draw(|frame| draw(frame, &snapshot, selected, panel, errors_only, &graph))?;
 
         if event::poll(Duration::from_millis(150))?
             && let Event::Key(key) = event::read()?
@@ -89,6 +92,18 @@ pub async fn run_tui(supervisor: Supervisor, selectors: Vec<String>) -> Result<(
                     let mut state = state.lock().await;
                     state.last_event = Some(format!("snapshot generated:\n{text}"));
                 }
+                KeyCode::Char('e') => {
+                    errors_only = !errors_only;
+                }
+                KeyCode::Char('g') => {
+                    panel = DetailPanel::Graph;
+                }
+                KeyCode::Char('f') => {
+                    panel = DetailPanel::Failures;
+                }
+                KeyCode::Char('?') => {
+                    panel = DetailPanel::Help;
+                }
                 _ => {}
             }
         }
@@ -113,7 +128,21 @@ pub async fn run_tui(supervisor: Supervisor, selectors: Vec<String>) -> Result<(
     result
 }
 
-fn draw(frame: &mut Frame<'_>, state: &SessionState, selected: usize) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailPanel {
+    Help,
+    Graph,
+    Failures,
+}
+
+fn draw(
+    frame: &mut Frame<'_>,
+    state: &SessionState,
+    selected: usize,
+    panel: DetailPanel,
+    errors_only: bool,
+    graph: &str,
+) {
     let root = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
@@ -152,6 +181,7 @@ fn draw(frame: &mut Frame<'_>, state: &SessionState, selected: usize) {
         .map(|task| {
             task.logs
                 .iter()
+                .filter(|line| !errors_only || is_error_line(line))
                 .rev()
                 .take(200)
                 .cloned()
@@ -163,7 +193,13 @@ fn draw(frame: &mut Frame<'_>, state: &SessionState, selected: usize) {
         })
         .unwrap_or_default();
     let title = selected_task
-        .map(|task| format!("Logs: {}", task.name))
+        .map(|task| {
+            if errors_only {
+                format!("Logs: {} (errors only)", task.name)
+            } else {
+                format!("Logs: {}", task.name)
+            }
+        })
         .unwrap_or_else(|| "Logs".into());
     frame.render_widget(
         Paragraph::new(logs)
@@ -172,21 +208,7 @@ fn draw(frame: &mut Frame<'_>, state: &SessionState, selected: usize) {
         right[0],
     );
 
-    let diagnosis = selected_task
-        .and_then(|task| task.diagnosis.as_ref())
-        .map(|diagnosis| {
-            format!(
-                "Likely cause: {}\nSuggested action: {}\nEvidence:\n{}",
-                diagnosis.title,
-                diagnosis.suggest,
-                diagnosis.evidence.join("\n")
-            )
-        })
-        .or_else(|| state.last_event.clone())
-        .unwrap_or_else(|| {
-            "j/k move  enter start  x stop  r restart  R restart dependants  s snapshot  q quit"
-                .into()
-        });
+    let diagnosis = detail_text(state, selected_task.copied(), panel, graph);
     frame.render_widget(
         Paragraph::new(diagnosis)
             .block(
@@ -197,6 +219,54 @@ fn draw(frame: &mut Frame<'_>, state: &SessionState, selected: usize) {
             .wrap(Wrap { trim: false }),
         right[1],
     );
+}
+
+fn detail_text(
+    state: &SessionState,
+    selected_task: Option<&crate::state::TaskState>,
+    panel: DetailPanel,
+    graph: &str,
+) -> String {
+    if let Some(diagnosis) = selected_task.and_then(|task| task.diagnosis.as_ref()) {
+        return format!(
+            "Likely cause: {}\nSuggested action: {}\nEvidence:\n{}",
+            diagnosis.title,
+            diagnosis.suggest,
+            diagnosis.evidence.join("\n")
+        );
+    }
+
+    match panel {
+        DetailPanel::Help => state.last_event.clone().unwrap_or_else(|| {
+            "j/k move  enter start  x stop  r restart  R restart dependants  e errors  g graph  f failures  s snapshot  ? help  q quit".into()
+        }),
+        DetailPanel::Graph => graph.to_string(),
+        DetailPanel::Failures => {
+            let failures = state
+                .tasks
+                .values()
+                .filter(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::CrashLoop))
+                .map(|task| {
+                    let detail = task.detail.as_deref().unwrap_or("");
+                    format!("{}: {} {detail}", task.name, task.status.label())
+                })
+                .collect::<Vec<_>>();
+            if failures.is_empty() {
+                "No failing tasks.".into()
+            } else {
+                failures.join("\n")
+            }
+        }
+    }
+}
+
+fn is_error_line(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    line.contains("error")
+        || line.contains("failed")
+        || line.contains("panic")
+        || line.contains("exception")
+        || line.contains("refused")
 }
 
 fn selected_task_name(state: &SessionState, selected: usize) -> Option<String> {

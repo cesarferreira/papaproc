@@ -101,6 +101,20 @@ impl TaskGraph {
         Ok(self.topological_subset(&downstream))
     }
 
+    pub fn render(&self) -> String {
+        let mut lines = Vec::new();
+        for (task, dependencies) in &self.dependencies {
+            if dependencies.is_empty() {
+                lines.push(task.clone());
+            } else {
+                for dependency in dependencies {
+                    lines.push(format!("{dependency} -> {task}"));
+                }
+            }
+        }
+        lines.join("\n")
+    }
+
     fn collect_with_dependencies(&self, task: &str, needed: &mut BTreeSet<String>) -> Result<()> {
         if !self.dependencies.contains_key(task) {
             bail!("unknown task '{task}'");

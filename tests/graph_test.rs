@@ -93,6 +93,34 @@ tasks:
     assert!(order.contains(&"worker".to_string()));
 }
 
+#[test]
+fn renders_dependency_graph_edges() {
+    let config = LoadConfig::from_yaml(
+        r#"
+version: 1
+tasks:
+  db:
+    cmd: db
+  api:
+    cmd: api
+    depends_on:
+      db: ready
+  web:
+    cmd: web
+    depends_on:
+      api: ready
+"#,
+    )
+    .unwrap();
+
+    let graph = TaskGraph::new(&config).unwrap();
+    let rendered = graph.render();
+
+    assert!(rendered.contains("db"));
+    assert!(rendered.contains("db -> api"));
+    assert!(rendered.contains("api -> web"));
+}
+
 fn position(order: &[String], task: &str) -> usize {
     order.iter().position(|name| name == task).unwrap()
 }

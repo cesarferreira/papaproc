@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+#[derive(Clone)]
 pub struct Supervisor {
     config: LoadConfig,
     graph: TaskGraph,
@@ -41,6 +42,10 @@ impl Supervisor {
 
     pub fn state(&self) -> Arc<Mutex<SessionState>> {
         self.state.clone()
+    }
+
+    pub fn graph_text(&self) -> String {
+        self.graph.render()
     }
 
     pub async fn start_selected(&self, selectors: &[String]) -> Result<()> {
@@ -80,6 +85,9 @@ impl Supervisor {
             .with_context(|| format!("unknown task '{name}'"))?
             .clone();
 
+        if self.children.lock().await.contains_key(name) {
+            self.stop_task(name).await?;
+        }
         self.preflight_ports(name, &task).await?;
 
         self.set_status(name, TaskStatus::Starting, None).await;
@@ -97,7 +105,7 @@ impl Supervisor {
             .lock()
             .await
             .insert(name.to_string(), child.clone());
-        self.spawn_exit_monitor(name.to_string(), child);
+        self.clone().spawn_exit_monitor(name.to_string(), child);
 
         let state = self.state.clone();
         let task_name = name.to_string();
@@ -160,6 +168,22 @@ impl Supervisor {
         Ok(())
     }
 
+    async fn restart_dependants(&self, name: &str) -> Result<()> {
+        for dependant in self.graph.downstream_order(name)? {
+            let restart = self
+                .config
+                .tasks
+                .get(&dependant)
+                .is_some_and(|task| task.restart.on_dependency_restart);
+            if restart {
+                self.stop_task(&dependant).await?;
+                self.wait_for_dependencies(&dependant).await?;
+                self.start_task(&dependant).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn stop_all(&self) {
         let names: Vec<String> = self.children.lock().await.keys().cloned().collect();
         for name in names {
@@ -219,49 +243,82 @@ impl Supervisor {
         });
     }
 
-    fn spawn_exit_monitor(&self, name: String, child: Arc<Mutex<Child>>) {
-        let state = self.state.clone();
-        let config = self.config.clone();
-        let diagnostics = self.diagnostics.clone();
+    fn spawn_exit_monitor(self, name: String, child: Arc<Mutex<Child>>) {
         tokio::spawn(async move {
-            let status = {
-                let mut child = child.lock().await;
-                child.wait().await
+            let status = loop {
+                let status = {
+                    let mut child = child.lock().await;
+                    child.try_wait()
+                };
+                match status {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                    Err(error) => break Err(error),
+                }
             };
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            match status {
-                Ok(status) if status.success() => {
-                    let mut state = state.lock().await;
-                    if let Some(task) = state.tasks.get_mut(&name)
-                        && task.status != TaskStatus::Stopped
-                    {
-                        task.status = TaskStatus::Stopped;
-                        task.last_exit = Some(status.to_string());
-                    }
-                    state.last_event = Some(format!("{name} exited with {status}"));
-                }
-                Ok(status) => {
-                    mark_failure_static(
-                        &state,
-                        &config,
-                        diagnostics.as_ref(),
-                        &name,
-                        status.to_string(),
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    mark_failure_static(
-                        &state,
-                        &config,
-                        diagnostics.as_ref(),
-                        &name,
-                        format!("wait failed: {error}"),
-                    )
-                    .await;
-                }
+            if let Err(error) = self.handle_child_exit(&name, status).await {
+                self.state.lock().await.last_event =
+                    Some(format!("{name} exit handler failed: {error}"));
             }
         });
+    }
+
+    async fn handle_child_exit(
+        &self,
+        name: &str,
+        status: std::io::Result<std::process::ExitStatus>,
+    ) -> Result<()> {
+        self.children.lock().await.remove(name);
+
+        let was_stopped = self
+            .state
+            .lock()
+            .await
+            .tasks
+            .get(name)
+            .is_some_and(|task| task.status == TaskStatus::Stopped);
+        if was_stopped {
+            return Ok(());
+        }
+
+        match status {
+            Ok(status) if status.success() => {
+                let mut state = self.state.lock().await;
+                if let Some(task) = state.tasks.get_mut(name)
+                    && task.status != TaskStatus::Stopped
+                {
+                    task.status = TaskStatus::Stopped;
+                    task.last_exit = Some(status.to_string());
+                }
+                state.last_event = Some(format!("{name} exited with {status}"));
+            }
+            Ok(status) => {
+                self.handle_task_failure(name, status.to_string()).await?;
+            }
+            Err(error) => {
+                self.handle_task_failure(name, format!("wait failed: {error}"))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_task_failure(&self, name: &str, reason: String) -> Result<()> {
+        let status = self.mark_failure(name, reason).await;
+        let Some(task) = self.config.tasks.get(name) else {
+            return Ok(());
+        };
+        if task.mode != Mode::Auto || status == TaskStatus::CrashLoop {
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        self.start_task(name).await?;
+        self.restart_dependants(name).await?;
+        self.state.lock().await.last_event =
+            Some(format!("self-healed {name} and restarted dependants"));
+        Ok(())
     }
 
     async fn set_status(&self, name: &str, status: TaskStatus, detail: Option<String>) {
@@ -279,9 +336,10 @@ impl Supervisor {
         state.last_event = Some(format!("{name} is {}", status.label()));
     }
 
-    async fn mark_failure(&self, name: &str, reason: String) {
+    async fn mark_failure(&self, name: &str, reason: String) -> TaskStatus {
         let mut state = self.state.lock().await;
         let now = Instant::now();
+        let mut status = TaskStatus::Failed;
         if let Some(task) = state.tasks.get_mut(name) {
             task.last_exit = Some(reason.clone());
             task.recent_failures.push_back(now);
@@ -293,11 +351,12 @@ impl Supervisor {
                 {
                     task.recent_failures.pop_front();
                 }
-                task.status = if task.recent_failures.len() >= config.restart.attempts {
+                status = if task.recent_failures.len() >= config.restart.attempts {
                     TaskStatus::CrashLoop
                 } else {
                     TaskStatus::Failed
                 };
+                task.status = status;
             } else {
                 task.status = TaskStatus::Failed;
             }
@@ -305,44 +364,8 @@ impl Supervisor {
             task.diagnosis = self.diagnostics.diagnose(name, &logs);
         }
         state.last_event = Some(format!("{name} failed: {reason}"));
+        status
     }
-}
-
-async fn mark_failure_static(
-    state: &Arc<Mutex<SessionState>>,
-    config: &LoadConfig,
-    diagnostics: &DiagnosticEngine,
-    name: &str,
-    reason: String,
-) {
-    let mut state = state.lock().await;
-    let now = Instant::now();
-    if let Some(task) = state.tasks.get_mut(name) {
-        if task.status == TaskStatus::Stopped {
-            return;
-        }
-        task.last_exit = Some(reason.clone());
-        task.recent_failures.push_back(now);
-        if let Some(task_config) = config.tasks.get(name) {
-            while task
-                .recent_failures
-                .front()
-                .is_some_and(|first| now.duration_since(*first) > task_config.restart.window)
-            {
-                task.recent_failures.pop_front();
-            }
-            task.status = if task.recent_failures.len() >= task_config.restart.attempts {
-                TaskStatus::CrashLoop
-            } else {
-                TaskStatus::Failed
-            };
-        } else {
-            task.status = TaskStatus::Failed;
-        }
-        let logs = task.log_snapshot();
-        task.diagnosis = diagnostics.diagnose(name, &logs);
-    }
-    state.last_event = Some(format!("{name} failed: {reason}"));
 }
 
 async fn spawn_child(task: &TaskConfig) -> Result<Child> {
