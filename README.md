@@ -237,7 +237,7 @@ Task fields:
 | Field | Purpose |
 |---|---|
 | `cmd` | Command to run. Required. |
-| `cwd` | Working directory. |
+| `cwd` | Working directory. Relative paths are resolved from the config file's directory. |
 | `env` | Environment variables. |
 | `mode` | `auto`, `manual`, or `once`. Defaults to `auto`. |
 | `depends_on` | Map of upstream task to `ready`. |

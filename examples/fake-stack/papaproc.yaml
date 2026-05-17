@@ -14,7 +14,7 @@ diagnostics:
 
 tasks:
   fake-db:
-    cwd: examples/fake-stack
+    cwd: .
     cmd: bash scripts/fake-db.sh
     ready:
       tcp: 127.0.0.1:15432
@@ -26,7 +26,7 @@ tasks:
       on_dependency_restart: true
 
   fake-api:
-    cwd: examples/fake-stack
+    cwd: .
     cmd: bash scripts/fake-api.sh
     depends_on:
       fake-db: ready
@@ -40,7 +40,7 @@ tasks:
       on_dependency_restart: true
 
   fake-web:
-    cwd: examples/fake-stack
+    cwd: .
     cmd: bash scripts/fake-web.sh
     depends_on:
       fake-api: ready
@@ -54,6 +54,6 @@ tasks:
       on_dependency_restart: true
 
   noisy-logs:
-    cwd: examples/fake-stack
+    cwd: .
     cmd: bash scripts/noisy-logs.sh
     mode: manual

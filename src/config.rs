@@ -100,12 +100,17 @@ impl LoadConfig {
         let path = path.as_ref();
         let yaml = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        Self::from_yaml(&yaml)
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        Self::from_yaml_with_base(&yaml, Some(base_dir))
     }
 
     pub fn from_yaml(yaml: &str) -> Result<Self> {
+        Self::from_yaml_with_base(yaml, None)
+    }
+
+    fn from_yaml_with_base(yaml: &str, base_dir: Option<&Path>) -> Result<Self> {
         let raw: RawConfig = serde_yaml::from_str(yaml).context("failed to parse YAML config")?;
-        let config = raw.into_config()?;
+        let config = raw.into_config(base_dir)?;
         config.validate()?;
         Ok(config)
     }
@@ -161,7 +166,7 @@ struct RawConfig {
 }
 
 impl RawConfig {
-    fn into_config(self) -> Result<LoadConfig> {
+    fn into_config(self, base_dir: Option<&Path>) -> Result<LoadConfig> {
         let groups = self
             .groups
             .into_iter()
@@ -170,7 +175,7 @@ impl RawConfig {
 
         let mut tasks = BTreeMap::new();
         for (name, raw) in self.tasks {
-            tasks.insert(name, raw.into_task()?);
+            tasks.insert(name, raw.into_task(base_dir)?);
         }
 
         Ok(LoadConfig {
@@ -217,7 +222,7 @@ struct RawTask {
 }
 
 impl RawTask {
-    fn into_task(self) -> Result<TaskConfig> {
+    fn into_task(self, base_dir: Option<&Path>) -> Result<TaskConfig> {
         let mode = match self.mode.as_deref().unwrap_or("auto") {
             "auto" => Mode::Auto,
             "manual" => Mode::Manual,
@@ -237,7 +242,10 @@ impl RawTask {
 
         Ok(TaskConfig {
             cmd: self.cmd,
-            cwd: self.cwd,
+            cwd: self.cwd.map(|cwd| match base_dir {
+                Some(base_dir) if cwd.is_relative() => base_dir.join(cwd),
+                _ => cwd,
+            }),
             env: self.env,
             mode,
             group: self.group,

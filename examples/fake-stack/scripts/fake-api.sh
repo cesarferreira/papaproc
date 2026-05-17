@@ -8,7 +8,7 @@ sleep 2
 echo "[fake-api] connected to fake-db"
 echo "[fake-api] ready on http://127.0.0.1:${port}/health"
 
-python3 -u - "$port" <<'PY'
+exec python3 -u - "$port" <<'PY'
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import sys
 

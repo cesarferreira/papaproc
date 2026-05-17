@@ -7,7 +7,7 @@ echo "[fake-db] booting database container..."
 sleep 2
 echo "[fake-db] ready on 127.0.0.1:${port}"
 
-python3 -u - "$port" <<'PY'
+exec python3 -u - "$port" <<'PY'
 import socket
 import sys
 import time

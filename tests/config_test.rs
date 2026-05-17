@@ -1,4 +1,5 @@
 use papaproc::config::{LoadConfig, Mode, ReadyProbe};
+use std::path::Path;
 
 #[test]
 fn parses_valid_config_with_defaults() {
@@ -100,8 +101,54 @@ fn top_level_example_config_is_runnable_fake_stack() {
     assert_eq!(config.project.as_deref(), Some("fake-stack"));
     assert_eq!(
         config.tasks["fake-db"].cwd.as_deref(),
-        Some(std::path::Path::new("examples/fake-stack"))
+        Some(Path::new("fake-stack"))
     );
     assert!(config.tasks.contains_key("fake-api"));
     assert!(config.tasks.contains_key("fake-web"));
+}
+
+#[test]
+fn top_level_example_config_resolves_cwd_from_its_directory() {
+    let config = LoadConfig::from_path("examples/papaproc.yaml")
+        .expect("top-level example config should parse");
+
+    assert_eq!(
+        config.tasks["fake-db"].cwd.as_deref(),
+        Some(Path::new("examples/fake-stack"))
+    );
+}
+
+#[test]
+fn from_path_resolves_relative_cwd_from_config_file_directory() {
+    let root = std::env::temp_dir().join(format!(
+        "papaproc-config-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = root.join("examples");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("papaproc.yaml");
+    std::fs::write(
+        &config_path,
+        r#"
+version: 1
+tasks:
+  api:
+    cwd: fake-stack
+    cmd: bash scripts/fake-api.sh
+"#,
+    )
+    .unwrap();
+
+    let config = LoadConfig::from_path(&config_path).expect("config should parse");
+
+    assert_eq!(
+        config.tasks["api"].cwd.as_deref(),
+        Some(config_dir.join("fake-stack").as_path())
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
 }
